@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Neon Dodge — a tiny browser game</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; background: #050510;
+    overflow: hidden; font-family: "Segoe UI", system-ui, sans-serif;
+  }
+  #wrap {
+    position: fixed; inset: 0; display: flex;
+    align-items: center; justify-content: center;
+  }
+  canvas {
+    display: block; background: #070718; border-radius: 8px;
+    box-shadow: 0 0 60px rgba(90, 60, 255, 0.35), 0 0 24px rgba(0, 229, 255, 0.18);
+    touch-action: none;
+  }
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: 10px; text-align: center;
+    color: #8a8fb5; font-size: 13px; letter-spacing: 0.08em;
+    pointer-events: none; user-select: none;
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="480" height="720"></canvas></div>
+<div id="hint">← → MOVE &nbsp;·&nbsp; COLLECT STARS &nbsp;·&nbsp; DODGE ROCKS &nbsp;·&nbsp; R = RESTART</div>
+<script>
+"use strict";
+/*
+ * NEON DODGE — a tiny browser game, one file, no libraries, no network.
+ * Pilot the ship, dodge the asteroids, collect the stars.
+ * 3 lives. A hit costs a life and shields the ship for a moment.
+ * The longer you survive, the faster it falls.
+ */
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const W = canvas.width, H = canvas.height;
+
+const SHIP_W = 46, SHIP_H = 34, SHIP_Y = H - 90;
+const STAR_POINTS = 10;
+
+const state = {
+  mode: "title",      // "title" | "playing" | "over"
+  score: 0,
+  lives: 3,
+  best: 0,
+  time: 0,            // seconds survived
+  spawnClock: 0,
+  shieldUntil: 0,     // seconds of play during which hits are ignored
+  shipX: W / 2,
+  shipTarget: W / 2,
+  keys: { left: false, right: false },
+  rocks: [],          // {x, y, r, vy, rot, vr, sides}
+  stars: [],          // {x, y, r, vy, phase}
+  parts: [],          // {x, y, vx, vy, life, max, color, size}
+  flashes: [],        // {x, y, r, life, max}
+};
+
+function rand(a, b) { return a + Math.random() * (b - a); }
+function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+
+function resetGame() {
+  state.mode = "playing";
+  state.score = 0;
+  state.lives = 3;
+  state.time = 0;
+  state.spawnClock = 0;
+  state.shieldUntil = 0;
+  state.shipX = W / 2;
+  state.shipTarget = W / 2;
+  state.rocks = [];
+  state.stars = [];
+  state.parts = [];
+  state.flashes = [];
+}
+
+function spawnRock() {
+  const r = rand(14, 30);
+  state.rocks.push({
+    x: rand(r, W - r), y: -r - 10, r,
+    vy: rand(140, 210) + state.time * 6,
+    rot: rand(0, Math.PI * 2), vr: rand(-1.6, 1.6),
+    sides: 7 + Math.floor(rand(0, 3)),
+  });
+}
+
+function spawnStar() {
+  state.stars.push({
+    x: rand(16, W - 16), y: -16, r: 11,
+    vy: rand(110, 160) + state.time * 4, phase: rand(0, Math.PI * 2),
+  });
+}
+
+function burst(x, y, color, n, speed) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, Math.PI * 2), s = rand(speed * 0.3, speed);
+    state.parts.push({
+      x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+      life: rand(0.35, 0.8), max: 0.8, color, size: rand(2, 4.5),
+    });
+  }
+}
+
+function shipHit() {
+  if (state.time < state.shieldUntil) return;
+  state.lives -= 1;
+  state.shieldUntil = state.time + 2.0;
+  burst(state.shipX, SHIP_Y, "#ff4d6d", 26, 260);
+  state.flashes.push({ x: state.shipX, y: SHIP_Y, r: 10, life: 0.45, max: 0.45 });
+  if (state.lives <= 0) {
+    state.mode = "over";
+    state.best = Math.max(state.best, state.score);
+    burst(state.shipX, SHIP_Y, "#00e5ff", 40, 320);
+    burst(state.shipX, SHIP_Y, "#ff4d6d", 30, 240);
+  }
+}
+
+function starCaught(s) {
+  state.score += STAR_POINTS;
+  burst(s.x, s.y, "#ffd166", 14, 160);
+}
+
+function step(dt) {
+  if (state.mode !== "playing") return;
+  state.time += dt;
+
+  // --- steering: keys move a target, the ship eases toward it ---
+  const speed = 420;
+  if (state.keys.left) state.shipTarget -= speed * dt;
+  if (state.keys.right) state.shipTarget += speed * dt;
+  state.shipTarget = clamp(state.shipTarget, SHIP_W / 2 + 6, W - SHIP_W / 2 - 6);
+  state.shipX += (state.shipTarget - state.shipX) * Math.min(1, dt * 14);
+
+  // --- spawning: faster and denser as time passes ---
+  state.spawnClock += dt;
+  const interval = Math.max(0.32, 0.85 - state.time * 0.012);
+  while (state.spawnClock >= interval) {
+    state.spawnClock -= interval;
+    if (Math.random() < 0.62) spawnRock(); else spawnStar();
+  }
+
+  // --- rocks ---
+  for (let i = state.rocks.length - 1; i >= 0; i--) {
+    const r = state.rocks[i];
+    r.y += r.vy * dt;
+    r.rot += r.vr * dt;
+    if (r.y - r.r > H) { state.rocks.splice(i, 1); continue; }
+    const dx = r.x - state.shipX, dy = r.y - SHIP_Y;
+    const hitR = r.r * 0.82 + 12;
+    if (dx * dx + dy * dy < hitR * hitR) {
+      state.rocks.splice(i, 1);
+      shipHit();
+      if (state.mode !== "playing") return;
+    }
+  }
+
+  // --- stars ---
+  for (let i = state.stars.length - 1; i >= 0; i--) {
+    const s = state.stars[i];
+    s.y += s.vy * dt;
+    s.phase += dt * 5;
+    if (s.y - s.r > H) { state.stars.splice(i, 1); continue; }
+    const dx = s.x - state.shipX, dy = s.y - SHIP_Y;
+    if (dx * dx + dy * dy < (s.r + 16) * (s.r + 16)) {
+      state.stars.splice(i, 1);
+      starCaught(s);
+    }
+  }
+
+  // --- particles and flashes ---
+  for (let i = state.parts.length - 1; i >= 0; i--) {
+    const p = state.parts[i];
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 60 * dt; p.life -= dt;
+    if (p.life <= 0) state.parts.splice(i, 1);
+  }
+  for (let i = state.flashes.length - 1; i >= 0; i--) {
+    const f = state.flashes[i];
+    f.life -= dt; f.r += 260 * dt;
+    if (f.life <= 0) state.flashes.splice(i, 1);
+  }
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#0a0a28");
+  g.addColorStop(0.6, "#070718");
+  g.addColorStop(1, "#120826");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  // starfield (fixed pseudo-random dots, cheap and steady)
+  ctx.save();
+  for (let i = 0; i < 70; i++) {
+    const x = (i * 97.3) % W, y = (i * 173.7) % H;
+    const tw = 0.35 + 0.3 * Math.sin(state.time * 2 + i);
+    ctx.globalAlpha = Math.max(0.08, tw);
+    ctx.fillStyle = i % 5 === 0 ? "#9be7ff" : "#ffffff";
+    ctx.fillRect(x, y, 2, 2);
+  }
+  ctx.restore();
+}
+
+function drawShip() {
+  const blink = state.time < state.shieldUntil && Math.floor(state.time * 12) % 2 === 0;
+  if (blink) return; // shield flicker
+  const x = state.shipX, y = SHIP_Y;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.shadowColor = "#00e5ff";
+  ctx.shadowBlur = 18;
+  ctx.fillStyle = "#00e5ff";
+  ctx.beginPath();
+  ctx.moveTo(0, -SHIP_H / 2);
+  ctx.lineTo(SHIP_W / 2, SHIP_H / 2);
+  ctx.lineTo(0, SHIP_H / 4);
+  ctx.lineTo(-SHIP_W / 2, SHIP_H / 2);
+  ctx.closePath();
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = "#e8fdff";
+  ctx.beginPath();
+  ctx.arc(0, -2, 5, 0, Math.PI * 2);
+  ctx.fill();
+  // engine flame
+  const f = 10 + Math.sin(state.time * 30) * 4;
+  ctx.fillStyle = "#ff9f1c";
+  ctx.beginPath();
+  ctx.moveTo(-6, SHIP_H / 2 + 2);
+  ctx.lineTo(0, SHIP_H / 2 + 2 + f);
+  ctx.lineTo(6, SHIP_H / 2 + 2);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawRock(r) {
+  ctx.save();
+  ctx.translate(r.x, r.y);
+  ctx.rotate(r.rot);
+  ctx.shadowColor = "#b388ff";
+  ctx.shadowBlur = 12;
+  ctx.fillStyle = "#3d3458";
+  ctx.strokeStyle = "#b388ff";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let i = 0; i < r.sides; i++) {
+    const a = (i / r.sides) * Math.PI * 2;
+    const rr = r.r * (0.82 + 0.18 * Math.sin(i * 2.7 + r.sides));
+    const px = Math.cos(a) * rr, py = Math.sin(a) * rr;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawStar(s) {
+  const tw = 0.75 + 0.25 * Math.sin(s.phase);
+  ctx.save();
+  ctx.translate(s.x, s.y);
+  ctx.globalAlpha = tw;
+  ctx.shadowColor = "#ffd166";
+  ctx.shadowBlur = 14;
+  ctx.fillStyle = "#ffd166";
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const a = (i / 10) * Math.PI * 2 - Math.PI / 2;
+    const rr = i % 2 === 0 ? s.r : s.r * 0.45;
+    const px = Math.cos(a) * rr, py = Math.sin(a) * rr;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawHud() {
+  ctx.save();
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#e8fdff";
+  ctx.font = "bold 26px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillText("SCORE  " + state.score, 16, 14);
+  ctx.font = "bold 20px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillStyle = "#ffd166";
+  ctx.fillText("BEST  " + state.best, 16, 48);
+  // lives as hearts
+  for (let i = 0; i < 3; i++) {
+    const x = W - 30 - i * 34, y = 28;
+    ctx.fillStyle = i < state.lives ? "#ff4d6d" : "#33263f";
+    ctx.beginPath();
+    ctx.moveTo(x, y + 6);
+    ctx.bezierCurveTo(x - 9, y - 4, x - 4, y - 12, x, y - 5);
+    ctx.bezierCurveTo(x + 4, y - 12, x + 9, y - 4, x, y + 6);
+    ctx.fill();
+  }
+  if (state.time < state.shieldUntil && state.mode === "playing") {
+    ctx.fillStyle = "#00e5ff";
+    ctx.font = "bold 15px 'Segoe UI', system-ui, sans-serif";
+    ctx.fillText("SHIELD!", W / 2 - 34, 16);
+  }
+  ctx.restore();
+}
+
+function centerText(lines, y0, gap) {
+  ctx.save();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  lines.forEach((ln, i) => {
+    ctx.font = ln.font;
+    ctx.fillStyle = ln.color;
+    ctx.shadowColor = ln.glow || "transparent";
+    ctx.shadowBlur = ln.glow ? 16 : 0;
+    ctx.fillText(ln.text, W / 2, y0 + i * gap);
+  });
+  ctx.restore();
+}
+
+function drawTitle() {
+  ctx.fillStyle = "rgba(5, 5, 16, 0.55)";
+  ctx.fillRect(0, 0, W, H);
+  centerText([
+    { text: "NEON DODGE", font: "bold 54px 'Segoe UI', system-ui, sans-serif", color: "#00e5ff", glow: "#00e5ff" },
+    { text: "one prompt · one game", font: "20px 'Segoe UI', system-ui, sans-serif", color: "#b388ff" },
+  ], H / 2 - 90, 64);
+  centerText([
+    { text: "← →  steer your ship", font: "19px 'Segoe UI', system-ui, sans-serif", color: "#e8fdff" },
+    { text: "★  collect stars  ·  +10 pts", font: "19px 'Segoe UI', system-ui, sans-serif", color: "#ffd166" },
+    { text: "◆  dodge the rocks  ·  3 lives", font: "19px 'Segoe UI', system-ui, sans-serif", color: "#ff8fa3" },
+  ], H / 2 + 30, 34);
+  const pulse = 0.6 + 0.4 * Math.sin(state.time * 4);
+  ctx.save();
+  ctx.globalAlpha = pulse;
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 22px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillText("PRESS SPACE OR TAP TO PLAY", W / 2, H / 2 + 170);
+  ctx.restore();
+}
+
+function drawGameOver() {
+  ctx.fillStyle = "rgba(5, 5, 16, 0.6)";
+  ctx.fillRect(0, 0, W, H);
+  centerText([
+    { text: "GAME OVER", font: "bold 52px 'Segoe UI', system-ui, sans-serif", color: "#ff4d6d", glow: "#ff4d6d" },
+    { text: "score  " + state.score, font: "bold 30px 'Segoe UI', system-ui, sans-serif", color: "#e8fdff" },
+    { text: state.score >= state.best && state.score > 0 ? "★ new best! ★" : "best  " + state.best, font: "20px 'Segoe UI', system-ui, sans-serif", color: "#ffd166" },
+  ], H / 2 - 70, 58);
+  const pulse = 0.6 + 0.4 * Math.sin(state.time * 4);
+  ctx.save();
+  ctx.globalAlpha = pulse;
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 22px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillText("PRESS R TO PLAY AGAIN", W / 2, H / 2 + 120);
+  ctx.restore();
+}
+
+function draw() {
+  drawBackground();
+  for (const s of state.stars) drawStar(s);
+  for (const r of state.rocks) drawRock(r);
+  if (state.mode !== "over") drawShip();
+  for (const p of state.parts) {
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, p.life / p.max);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+    ctx.restore();
+  }
+  for (const f of state.flashes) {
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, f.life / f.max) * 0.8;
+    ctx.strokeStyle = "#ff4d6d";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, f.r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+  drawHud();
+  if (state.mode === "title") drawTitle();
+  if (state.mode === "over") drawGameOver();
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (state.mode === "playing") step(dt);
+  else state.time += dt; // keep the title pulse and star twinkle moving
+  draw();
+  requestAnimationFrame(frame);
+}
+
+function startIfIdle() {
+  if (state.mode === "title" || state.mode === "over") resetGame();
+}
+
+window.addEventListener("keydown", (e) => {
+  if (e.code === "ArrowLeft" || e.code === "KeyA") { state.keys.left = true; e.preventDefault(); }
+  if (e.code === "ArrowRight" || e.code === "KeyD") { state.keys.right = true; e.preventDefault(); }
+  if (e.code === "Space" || e.code === "Enter") { startIfIdle(); e.preventDefault(); }
+  if (e.code === "KeyR" && state.mode === "over") resetGame();
+});
+window.addEventListener("keyup", (e) => {
+  if (e.code === "ArrowLeft" || e.code === "KeyA") state.keys.left = false;
+  if (e.code === "ArrowRight" || e.code === "KeyD") state.keys.right = false;
+});
+
+canvas.addEventListener("pointerdown", (e) => {
+  if (state.mode !== "playing") { startIfIdle(); return; }
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (W / rect.width);
+  state.shipTarget = clamp(x, SHIP_W / 2 + 6, W - SHIP_W / 2 - 6);
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (state.mode !== "playing" || e.buttons === 0) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (W / rect.width);
+  state.shipTarget = clamp(x, SHIP_W / 2 + 6, W - SHIP_W / 2 - 6);
+});
+
+// Expose a tiny handle for automated play-testing.
+window.__neonDodge = { state, resetGame, startIfIdle };
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
